@@ -1,14 +1,34 @@
-﻿console.log(String.raw`
-  ____              _         _    _     _ _
- |  _ \  ___  _ __ | |_   ___| | _(_) __| | |
- | | | |/ _ \| '_ \| __| / __| |/ / |/ _\` | |  _____
- | |_| | (_) | | | | |_  \__ \   <| | (_| |_| |_____|
- |____/ \___/|_| |_|\__| |___/_|\_\_|\__,_(_)
-   __| | __ ___   _(_) __| |
-  / _\` |/ _\` \ \ / / |/ _\` |
- | (_| | (_| |\ V /| | (_| |
-  \__,_|\__,_| \_/ |_|\__,_|
-`);
+﻿console.log(`${getFrostedPrefix()}: loaded index.js`)
+
+function getProxyModeTag() {
+	try {
+		var raw = String(localStorage.getItem("fb_proxy_mode") || "scramjet").trim().toLowerCase();
+		return raw === "ultraviolet" ? "uv" : "sj";
+	} catch {
+		return "sj";
+	}
+}
+
+function hasActiveProxiedTab() {
+	try {
+		var activeTab = Array.isArray(tabs) ? tabs.find((tab) => tab.id === activeTabId) : null;
+		var activeUrl = String(activeTab?.url || "").trim();
+		if (!activeUrl) return false;
+		if (isSettingsInternalUrl(activeUrl)) return false;
+		if (isPartnersInternalUrl(activeUrl)) return false;
+		if (isGamesInternalUrl(activeUrl)) return false;
+		if (isAiInternalUrl(activeUrl)) return false;
+		if (isExtensionInternalUrl(activeUrl) || isExtensionStoreInternalUrl(activeUrl)) return false;
+		if (isCreditsInternalUrl(activeUrl)) return false;
+		return !isSameAppOriginUrl(activeUrl);
+	} catch {
+		return false;
+	}
+}
+
+function getFrostedPrefix() {
+	return hasActiveProxiedTab() ? `[frosted (${getProxyModeTag()})]` : "[frosted]";
+}
 
 "use strict";
 var BareMux = window.BareMux;
@@ -114,6 +134,11 @@ var errorRefs = {
 	errorDetails: qs("#sj-error-code"),
 };
 
+var proxyRefs = {
+	proxySelect: qs("#proxySelect"),
+	proxyStatus: qs("#proxy-status"),
+};
+
 var {
 	tabsEl,
 	tabCounter,
@@ -207,6 +232,56 @@ var {
 
 var { errorPanel, errorTitle, errorDetails } = errorRefs;
 
+var { proxySelect, proxyStatus } = proxyRefs;
+var proxyModeStorage = "fb_proxy_mode";
+
+function normalizeProxyMode(value) {
+	return String(value || "").trim().toLowerCase() === "ultraviolet" ? "ultraviolet" : "scramjet";
+}
+
+function getProxyMode() {
+	return normalizeProxyMode(localStorage.getItem(proxyModeStorage) || "scramjet");
+}
+
+function updateProxyStatus() {
+	if (!proxyStatus) return;
+	proxyStatus.textContent =
+		getProxyMode() === "ultraviolet"
+			? "Proxy mode: Ultraviolet"
+			: "Proxy mode: Scramjet";
+}
+
+function loadProxySettings() {
+	var mode = getProxyMode();
+	if (proxySelect) proxySelect.value = mode;
+	updateProxyStatus();
+}
+
+function resetAllTabFrames() {
+	var activeId = activeTabId;
+	Array.from(tabFrames.keys()).forEach((tabId) => destroyTabFrame(tabId));
+	if (!activeId) return;
+	var activeTab = tabs.find((entry) => entry.id === activeId);
+	if (!activeTab) return;
+	if (String(activeTab.url || "").trim()) {
+		frameReadyByTab.delete(activeId);
+		showBlank();
+	}
+}
+
+function setProxyMode(value) {
+	var nextMode = normalizeProxyMode(value);
+	var currentMode = getProxyMode();
+	if (nextMode === currentMode) {
+		loadProxySettings();
+		return;
+	}
+	localStorage.setItem(proxyModeStorage, nextMode);
+	transportReady = false;
+	resetAllTabFrames();
+	loadProxySettings();
+}
+
 var appBasePath = (() => {
 	var path = String(window.location.pathname || "/").replace(/\/[^/]*$/, "/");
 	if (!path.startsWith("/")) path = `/${path}`;
@@ -217,29 +292,155 @@ var scramjetPrefix = (() => {
 	return `${appBasePath}scramjet/`.replace(/\/{2,}/g, "/");
 })();
 
-var { ScramjetController } = $scramjetLoadController();
-var scramjet = new ScramjetController({
-	prefix: scramjetPrefix,
-	files: {
-		wasm: "./scram/scramjet.wasm.wasm",
-		all: "./scram/scramjet.all.js",
-		sync: "./scram/scramjet.sync.js",
-	},
-});
-scramjet.init();
-
-var connection = new BareMux.BareMuxConnection(`${appBasePath}baremux/worker.js`);
+var uvPrefix = "/uv/service/";
+var scramjet = null;
+var connection = null;
+var runtimeInitPromise = null;
+var uvRuntimePromise = null;
 var tabs = [];
 var activeTabId = null;
 var nextTabId = 1;
 var transportReady = false;
 var tabFrames = new Map();
+var frameReadyByTab = new Set();
+var frameEarlyReadyPollByTab = new Map();
 var frameLoadTimeoutIdByTab = new Map();
 var suppressNextFrameNavSyncByTab = new Set();
 var aiChatHistory = [];
 var aiTypingRunId = 0;
 var aiUiThread = [];
 var gamesCatalog = [];
+
+async function ensureBareMuxGlobal() {
+	if (globalThis.BareMux?.BareMuxConnection) return globalThis.BareMux;
+	await import(`${appBasePath}baremux/index.js?v=3`);
+	if (!globalThis.BareMux?.BareMuxConnection) {
+		throw new Error("BareMux failed to load.");
+	}
+	return globalThis.BareMux;
+}
+
+function isMissingObjectStoreError(error) {
+	return (
+		error?.name === "NotFoundError" &&
+		String(error?.message || "").toLowerCase().includes("object store")
+	);
+}
+
+function deleteIndexedDb(databaseName) {
+	return new Promise((resolve, reject) => {
+		if (!globalThis.indexedDB) {
+			resolve(false);
+			return;
+		}
+		try {
+			var request = indexedDB.deleteDatabase(databaseName);
+			request.onsuccess = () => resolve(true);
+			request.onerror = () => reject(request.error || new Error(`Failed to delete IndexedDB database: ${databaseName}`));
+			request.onblocked = () => resolve(false);
+		} catch (error) {
+			reject(error);
+		}
+	});
+}
+
+function loadScriptOnce(src) {
+	return new Promise((resolve, reject) => {
+		var absoluteSrc = new URL(src, window.location.href).href;
+		var existing = Array.from(document.scripts || []).find((script) => script.src === absoluteSrc);
+		if (existing) {
+			if (existing.dataset.fbLoaded === "true") {
+				resolve();
+				return;
+			}
+			existing.addEventListener("load", () => resolve(), { once: true });
+			existing.addEventListener("error", () => reject(new Error(`Failed to load script: ${src}`)), { once: true });
+			return;
+		}
+		var script = document.createElement("script");
+		script.src = src;
+		script.async = false;
+		script.addEventListener(
+			"load",
+			() => {
+				script.dataset.fbLoaded = "true";
+				resolve();
+			},
+			{ once: true }
+		);
+		script.addEventListener("error", () => reject(new Error(`Failed to load script: ${src}`)), { once: true });
+		document.head.appendChild(script);
+	});
+}
+
+async function ensureUvRuntime() {
+	if (window.__uv$config?.encodeUrl) return window.__uv$config;
+	if (uvRuntimePromise) return uvRuntimePromise;
+	uvRuntimePromise = (async () => {
+		if (!window.Ultraviolet) {
+			await loadScriptOnce(`${appBasePath}uv/uv.bundle.js`);
+		}
+		if (!window.__uv$config?.encodeUrl) {
+			await loadScriptOnce(`${appBasePath}uv/uv.config.js`);
+		}
+		if (!window.__uv$config?.encodeUrl) {
+			throw new Error("Ultraviolet runtime failed to load.");
+		}
+		return window.__uv$config;
+	})().catch((error) => {
+		uvRuntimePromise = null;
+		throw error;
+	});
+	return uvRuntimePromise;
+}
+
+async function initializeProxyRuntime() {
+	if (scramjet && connection) return { scramjet, connection };
+	if (runtimeInitPromise) return runtimeInitPromise;
+
+	runtimeInitPromise = (async () => {
+		var bareMuxModule = await ensureBareMuxGlobal();
+		if (getProxyMode() === "ultraviolet") {
+			await ensureUvRuntime();
+		}
+		await registerSW();
+		var loadController =
+			typeof window.$scramjetLoadController === "function" ? window.$scramjetLoadController : $scramjetLoadController;
+		if (typeof loadController !== "function") {
+			throw new Error("Scramjet controller loader is unavailable.");
+		}
+		var { ScramjetController } = loadController();
+		var createScramjet = () =>
+			new ScramjetController({
+				prefix: scramjetPrefix,
+				files: {
+					wasm: `${appBasePath}scram/scramjet.wasm.wasm`,
+					all: `${appBasePath}scram/scramjet.all.js`,
+					sync: `${appBasePath}scram/scramjet.sync.js`,
+				},
+			});
+		scramjet = createScramjet();
+		try {
+			await scramjet.init();
+		} catch (error) {
+			if (!isMissingObjectStoreError(error)) throw error;
+			console.warn("[frosted] scramjet IndexedDB schema mismatch detected; recreating $scramjet database.");
+			await deleteIndexedDb("$scramjet");
+			scramjet = createScramjet();
+			await scramjet.init();
+		}
+		connection = new bareMuxModule.BareMuxConnection(`${appBasePath}baremux/worker.js`);
+		return { scramjet, connection };
+	})().catch((error) => {
+		runtimeInitPromise = null;
+		scramjet = null;
+		connection = null;
+		throw error;
+	});
+
+	return runtimeInitPromise;
+}
+
 const GAMES_JSON = [
   {
     "id": -1,
@@ -7297,7 +7498,7 @@ function applyfrosteddBarConfig(config = frosteddBarConfig) {
 	root.style.setProperty("--chrome-row-gap", String(config.rowGap || "").trim());
 }
 
-function init() {
+async function init() {
 	applyfrosteddBarConfig();
 	updateAdblockToggleLabel();
 	void ensureGhosteryEngine();
@@ -7316,7 +7517,9 @@ function init() {
 	applyCloakVisualState(document.hidden || !document.hasFocus());
 	runStartupBrandSequence();
 	loadAiMode();
+	await initializeProxyRuntime();
 	createTab("");
+	loadProxySettings();
 	bindEvents();
 	renderHistory();
 	void loadGamesCatalog();
@@ -7478,6 +7681,12 @@ function bindEvents() {
 	if (wallpaperSelect) {
 		wallpaperSelect.addEventListener("change", () => {
 			applyWallpaper(wallpaperSelect.value);
+		});
+	}
+
+	if (proxySelect) {
+		proxySelect.addEventListener("change", () => {
+			setProxyMode(proxySelect.value);
 		});
 	}
 
@@ -7846,6 +8055,12 @@ function destroyTabFrame(tabId) {
 		clearTimeout(pendingTimeout);
 		frameLoadTimeoutIdByTab.delete(tabId);
 	}
+	var earlyReadyPoll = frameEarlyReadyPollByTab.get(tabId);
+	if (earlyReadyPoll) {
+		clearInterval(earlyReadyPoll);
+		frameEarlyReadyPollByTab.delete(tabId);
+	}
+	frameReadyByTab.delete(tabId);
 	var frame = tabFrames.get(tabId);
 	if (!frame) return;
 	try {
@@ -7904,8 +8119,12 @@ function setActiveTab(id, keepView) {
 	} else if (isCreditsInternalUrl(tab.url)) {
 		showCreditsPage();
 	} else {
-		showFrameForTab(id);
-		hideInternalPages();
+		if (frameReadyByTab.has(id)) {
+			showFrameForTab(id);
+		} else {
+			showBlank();
+			showLoading(true);
+		}
 		addressInput.value = tab.url;
 		homeSearchInput.value = tab.url;
 	}
@@ -8005,6 +8224,15 @@ function getDisplayTitle(url) {
 		return parsed.hostname.slice(0, 24);
 	} catch {
 		return url.slice(0, 24);
+	}
+}
+
+function isSameAppOriginUrl(rawUrl) {
+	try {
+		var parsed = new URL(String(rawUrl || "").trim(), window.location.href);
+		return parsed.origin === window.location.origin;
+	} catch {
+		return false;
 	}
 }
 
@@ -8284,6 +8512,24 @@ function fromScramjetProxyUrl(rawUrl) {
 	}
 }
 
+function fromUltravioletProxyUrl(rawUrl) {
+	var target = String(rawUrl || "").trim();
+	if (!target || !window.__uv$config?.decodeUrl) return "";
+	try {
+		var parsed = new URL(target, window.location.href);
+		var marker = uvPrefix;
+		if (!parsed.pathname.startsWith(marker)) {
+			if (!parsed.pathname.startsWith("/uv/service/")) return target;
+			marker = "/uv/service/";
+		}
+		var encoded = parsed.pathname.slice(marker.length);
+		if (!encoded) return "";
+		return window.__uv$config.decodeUrl(encoded);
+	} catch {
+		return target;
+	}
+}
+
 function syncTabUrlFromFrame(tabId, frameElement) {
 	var tab = tabs.find((entry) => entry.id === tabId);
 	if (!tab) return;
@@ -8294,7 +8540,10 @@ function syncTabUrlFromFrame(tabId, frameElement) {
 		return;
 	}
 	if (!frameHref || frameHref === "about:blank") return;
-	var nextUrl = fromScramjetProxyUrl(frameHref);
+	var nextUrl =
+		frameElement?.dataset?.proxyMode === "ultraviolet"
+			? fromUltravioletProxyUrl(frameHref)
+			: fromScramjetProxyUrl(frameHref);
 	if (!nextUrl) return;
 	var prevUrl = String(tab.url || "").trim();
 	var changed = prevUrl !== nextUrl;
@@ -8398,6 +8647,14 @@ async function loadUrl(url, pushHistory = true) {
 	resetError();
 	var tab = getActiveTab();
 	if (!tab) return;
+	if (isSameAppOriginUrl(url)) {
+		showBlank();
+		showError(
+			"Cannot proxy this address.",
+			"Frosted cannot proxy its own app origin. Open this address in the browser directly instead."
+		);
+		return;
+	}
 	var previousUrl = String(tab.url || "");
 
 	if (pushHistory && tab.url) {
@@ -8450,8 +8707,8 @@ async function loadUrl(url, pushHistory = true) {
 	try {
 		await ensureTransport();
 		var frame = ensureTabFrame(tab.id);
-		showFrameForTab(tab.id);
 		if (!String(url || "").trim()) throw new Error("Invalid Scramjet target URL.");
+		frameReadyByTab.delete(tab.id);
 		var pendingTimeout = frameLoadTimeoutIdByTab.get(tab.id);
 		if (pendingTimeout) clearTimeout(pendingTimeout);
 		frameLoadTimeoutIdByTab.set(
@@ -8461,10 +8718,11 @@ async function loadUrl(url, pushHistory = true) {
 				frameLoadTimeoutIdByTab.delete(tab.id);
 			}, 12000)
 		);
-		await new Promise((resolve) => setTimeout(resolve, 2000));
 		suppressNextFrameNavSyncByTab.add(tab.id);
 		frame.go(url);
-		hideBlank();
+		if (frame.element?.dataset?.proxyMode === "scramjet") {
+			startScramjetEarlyReadyPoll(tab.id, frame.element);
+		}
 		addHistory(url);
 	} catch (err) {
 		showError("Failed to initialize proxy runtime.", err);
@@ -8473,12 +8731,51 @@ async function loadUrl(url, pushHistory = true) {
 	}
 }
 
+function startScramjetEarlyReadyPoll(tabId, frameElement) {
+	var existingPoll = frameEarlyReadyPollByTab.get(tabId);
+	if (existingPoll) clearInterval(existingPoll);
+	var pollId = setInterval(() => {
+		try {
+			var doc = frameElement?.contentDocument;
+			var readyState = String(doc?.readyState || "").toLowerCase();
+			var body = doc?.body;
+			var hasRenderableContent =
+				Boolean(body) &&
+				(body.childElementCount > 0 || String(body.textContent || "").trim().length > 0);
+			if (readyState === "interactive" || readyState === "complete" || hasRenderableContent) {
+				frameEarlyReadyPollByTab.delete(tabId);
+				clearInterval(pollId);
+				frameReadyByTab.add(tabId);
+				if (tabId === activeTabId) {
+					showFrameForTab(tabId);
+					showLoading(false);
+				}
+			}
+		} catch {
+		}
+	}, 120);
+	frameEarlyReadyPollByTab.set(tabId, pollId);
+}
+
 function ensureTabFrame(tabId) {
 	var existing = tabFrames.get(tabId);
 	if (existing) return existing;
 
-	var created = scramjet.createFrame();
+	var proxyMode = getProxyMode();
+	var created =
+		proxyMode === "ultraviolet"
+			? {
+				frame: document.createElement("iframe"),
+				go: (url) => {
+					if (!window.__uv$config?.encodeUrl) {
+						throw new Error("Ultraviolet runtime is not ready.");
+					}
+					created.frame.src = window.location.origin + uvPrefix + window.__uv$config.encodeUrl(url);
+				},
+			}
+			: scramjet.createFrame();
 	created.frame.className = "proxy-frame";
+	created.frame.dataset.proxyMode = proxyMode;
 	created.frame.style.display = "none";
 	created.frame.style.width = "100%";
 	created.frame.style.height = "100%";
@@ -8486,12 +8783,21 @@ function ensureTabFrame(tabId) {
 	created.frame.style.position = "absolute";
 	created.frame.style.inset = "0";
 	created.frame.addEventListener("load", () => {
+		var earlyReadyPoll = frameEarlyReadyPollByTab.get(tabId);
+		if (earlyReadyPoll) {
+			clearInterval(earlyReadyPoll);
+			frameEarlyReadyPollByTab.delete(tabId);
+		}
+		frameReadyByTab.add(tabId);
 		var pendingTimeout = frameLoadTimeoutIdByTab.get(tabId);
 		if (pendingTimeout) {
 			clearTimeout(pendingTimeout);
 			frameLoadTimeoutIdByTab.delete(tabId);
 		}
-		if (tabId === activeTabId) showLoading(false);
+		if (tabId === activeTabId) {
+			showFrameForTab(tabId);
+			showLoading(false);
+		}
 		syncTabUrlFromFrame(tabId, created.frame);
 		try {
 			if (shouldInjectAdblockForTab(tabId)) {
@@ -8503,6 +8809,7 @@ function ensureTabFrame(tabId) {
 		void runQueuedGameClickScriptForTab(tabId, created.frame);
 		void maybeRecoverRawHtmlCatalogGame(tabId, created.frame);
 	});
+
 	browserStage.appendChild(created.frame);
 	tabFrames.set(tabId, { go: created.go.bind(created), element: created.frame });
 	return tabFrames.get(tabId);
@@ -8514,6 +8821,9 @@ function ensureQuickContextMenu() {
 	menu.className = "quick-context-menu";
 	menu.id = "quickContextMenu";
 	menu.innerHTML = `
+		<button type="button" class="quick-context-item" data-action="settings">
+			<i class="fa-solid fa-gear"></i> Settings
+		</button>
 		<button type="button" class="quick-context-item" data-action="wallpapers">
 			<i class="fa-solid fa-image"></i> Open Wallpapers
 		</button>
@@ -8526,6 +8836,10 @@ function ensureQuickContextMenu() {
 		if (!item) return;
 		var action = String(item.dataset.action || "").trim();
 		hideQuickContextMenu();
+		if (action === "settings") {
+			navigateFromInput(settingsInternalUrl);
+			return;
+		}
 		if (action === "wallpapers") {
 			navigateFromInput(wallpapersInternalUrl);
 			return;
@@ -8881,7 +9195,7 @@ function probeWispEndpoint(wispUrl, timeoutMs = 3500) {
 
 async function ensureTransport() {
 	if (transportReady) return;
-	await registerSW();
+	await initializeProxyRuntime();
 	var candidates = getWispTransportCandidates();
 	var transportLoaders = getTransportLoaders();
 	var probeCache = new Map();
@@ -9401,7 +9715,6 @@ async function maybeRecoverRawHtmlCatalogGame(tabId, frameElement) {
 	var recoveredInPlace = recoverRawHtmlByDocumentWrite(targetDocument, currentUrl);
 	if (recoveredInPlace) return;
 
-  // Blob fallback / auto-open disabled: do not materialize or load blob URLs here.
   return;
 }
 
@@ -9432,7 +9745,6 @@ function resolveGameUrl(url) {
 }
 
 async function materializeGameBlobUrl(url) {
-  // Blob materialization disabled. Return original URL unchanged.
   return String(url || "");
 }
 
@@ -10872,7 +11184,18 @@ function showLoading(show) {
 function showError(title, detail) {
 	if (errorTitle) errorTitle.textContent = title;
 	if (errorDetails) errorDetails.textContent = detail ? String(detail) : "";
-	if (errorPanel) errorPanel.classList.add("show");
+	if (errorPanel) {
+		errorPanel.classList.add("show");
+		return;
+	}
+	if (loadingBanner) {
+		var popupTitle = loadingBanner.querySelector(".loading-popup-title");
+		var popupCopy = loadingBanner.querySelector(".loading-popup-copy");
+		if (popupTitle) popupTitle.textContent = title;
+		if (popupCopy) popupCopy.textContent = detail ? String(detail) : "An unexpected startup error occurred.";
+		loadingBanner.classList.add("show");
+	}
+	console.error(`${getFrostedPrefix()} startup error:`, title, detail);
 }
 
 function injectErudaIntoActiveTab() {
@@ -10912,7 +11235,10 @@ function resetError() {
 }
 
 bootstrapWallpaperFromStorage();
-init();
+init().catch((error) => {
+	showError("Failed to initialize proxy runtime.", error);
+	hideInitialLoadingPopup();
+});
 
 var initialLoadingPopupHidden = false;
 function hideInitialLoadingPopup() {
@@ -10932,4 +11258,4 @@ setTimeout(hideInitialLoadingPopup, 1200);
 
 
 
-// gooncoded :heartbroken:
+// npm pleas give me my account back :heartbroken:

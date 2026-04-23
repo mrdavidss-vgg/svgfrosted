@@ -1,7 +1,13 @@
 importScripts("./scram/scramjet.all.js");
+importScripts("./uv/uv.bundle.js");
+importScripts("./uv/uv.config.js");
+importScripts("./uv/uv.sw.js");
+
 // trying to hard block the new adblock.turtlecute.org scripts (fakeads)
 const { ScramjetServiceWorker } = $scramjetLoadWorker();
 const scramjet = new ScramjetServiceWorker();
+const uv = new UVServiceWorker();
+
 const hardBlockedAdKeywords = [
 	"adblock.turtlecute.org/js/pagead.js",
 	"adblock.turtlecute.org/js/widget/ads.js",
@@ -72,6 +78,161 @@ function shouldBypassScramjet(request) {
 	return false;
 }
 
+function getAppBasePath() {
+	try {
+		var path = String(self.location.pathname || "/").replace(/\/[^/]*$/, "/");
+		if (!path.startsWith("/")) path = `/${path}`;
+		return path.replace(/\/{2,}/g, "/");
+	} catch {
+		return "/";
+	}
+}
+
+function getScramjetPrefixPath() {
+	return `${getAppBasePath()}scramjet/`.replace(/\/{2,}/g, "/");
+}
+
+function getDefaultScramjetConfig() {
+	const appBasePath = getAppBasePath();
+	return {
+		prefix: getScramjetPrefixPath(),
+		globals: {
+			wrapfn: "$scramjet$wrap",
+			wrappropertybase: "$scramjet__",
+			wrappropertyfn: "$scramjet$prop",
+			cleanrestfn: "$scramjet$clean",
+			importfn: "$scramjet$import",
+			rewritefn: "$scramjet$rewrite",
+			metafn: "$scramjet$meta",
+			setrealmfn: "$scramjet$setrealm",
+			pushsourcemapfn: "$scramjet$pushsourcemap",
+			trysetfn: "$scramjet$tryset",
+			templocid: "$scramjet$temploc",
+			tempunusedid: "$scramjet$tempunused",
+		},
+		files: {
+			wasm: `${appBasePath}scram/scramjet.wasm.wasm`,
+			all: `${appBasePath}scram/scramjet.all.js`,
+			sync: `${appBasePath}scram/scramjet.sync.js`,
+		},
+		flags: {
+			serviceworkers: false,
+			syncxhr: false,
+			strictRewrites: true,
+			rewriterLogs: false,
+			captureErrors: true,
+			cleanErrors: false,
+			scramitize: false,
+			sourcemaps: true,
+			destructureRewrites: false,
+			interceptDownloads: false,
+			allowInvalidJs: true,
+			allowFailedIntercepts: true,
+		},
+		siteFlags: {},
+		codec: {
+			encode: (value) => (value ? encodeURIComponent(value) : value),
+			decode: (value) => (value ? decodeURIComponent(value) : value),
+		},
+	};
+}
+
+function isUvRequest(requestUrl) {
+	try {
+		var url = new URL(requestUrl);
+		return url.origin === location.origin && url.pathname.startsWith(self.__uv$config.prefix);
+	} catch {
+		return false;
+	}
+}
+
+function isScramjetRequest(requestUrl) {
+	try {
+		var url = new URL(requestUrl);
+		return url.origin === location.origin && url.pathname.startsWith(getScramjetPrefixPath());
+	} catch {
+		return false;
+	}
+}
+
+function isMissingObjectStoreError(error) {
+	return (
+		error?.name === "NotFoundError" &&
+		String(error?.message || "").toLowerCase().includes("object store")
+	);
+}
+
+function deleteIndexedDb(databaseName) {
+	return new Promise((resolve, reject) => {
+		try {
+			var request = indexedDB.deleteDatabase(databaseName);
+			request.onsuccess = () => resolve(true);
+			request.onerror = () => reject(request.error || new Error(`Failed to delete IndexedDB database: ${databaseName}`));
+			request.onblocked = () => resolve(false);
+		} catch (error) {
+			reject(error);
+		}
+	});
+}
+
+function openScramjetDb() {
+	return new Promise((resolve, reject) => {
+		try {
+			var request = indexedDB.open("$scramjet", 1);
+			request.onupgradeneeded = () => {
+				var db = request.result;
+				["config", "cookies", "redirectTrackers", "referrerPolicies", "publicSuffixList"].forEach((storeName) => {
+					if (!db.objectStoreNames.contains(storeName)) {
+						db.createObjectStore(storeName);
+					}
+				});
+			};
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error || new Error("Failed to open $scramjet IndexedDB."));
+		} catch (error) {
+			reject(error);
+		}
+	});
+}
+
+async function persistScramjetConfig(config) {
+	const db = await openScramjetDb();
+	await new Promise((resolve, reject) => {
+		try {
+			var tx = db.transaction(["config"], "readwrite");
+			tx.objectStore("config").put(config, "config");
+			tx.oncomplete = () => resolve();
+			tx.onerror = () => reject(tx.error || new Error("Failed to persist scramjet config."));
+			tx.onabort = () => reject(tx.error || new Error("Persisting scramjet config was aborted."));
+		} catch (error) {
+			reject(error);
+		}
+	});
+	try {
+		db.close();
+	} catch {}
+}
+
+async function loadScramjetConfigWithRecovery() {
+	try {
+		await scramjet.loadConfig();
+	} catch (error) {
+		if (!isMissingObjectStoreError(error)) throw error;
+		console.warn("[frosted-sw] scramjet IndexedDB schema mismatch detected; recreating $scramjet database.");
+		await deleteIndexedDb("$scramjet");
+		await scramjet.loadConfig();
+	}
+	if (!scramjet.config?.prefix) {
+		const fallbackConfig = getDefaultScramjetConfig();
+		await persistScramjetConfig(fallbackConfig);
+		scramjet.config = undefined;
+		await scramjet.loadConfig();
+		if (!scramjet.config?.prefix) {
+			scramjet.config = fallbackConfig;
+		}
+	}
+}
+
 async function handleRequest(event) {
 	if (isHardBlockedAdRequest(event.request)) {
 		return new Response("Blocked by Frosted adblockdY'-", {
@@ -84,14 +245,41 @@ async function handleRequest(event) {
 		});
 	}
 
+	if (isUvRequest(event.request.url)) {
+		return uv.fetch(event);
+	}
+
+	if (isScramjetRequest(event.request.url)) {
+		try {
+			await loadScramjetConfigWithRecovery();
+			if (scramjet.route(event)) {
+				return await scramjet.fetch(event);
+			}
+		} catch (error) {
+			console.error("[frosted-sw] scramjet fetch failed:", error);
+			return new Response("Scramjet failed to load this page.", {
+				status: 502,
+				statusText: "Scramjet Error",
+				headers: {
+					"content-type": "text/plain; charset=utf-8",
+					"cache-control": "no-store",
+				},
+			});
+		}
+		return new Response("Scramjet could not route this request.", {
+			status: 502,
+			statusText: "Scramjet Routing Error",
+			headers: {
+				"content-type": "text/plain; charset=utf-8",
+				"cache-control": "no-store",
+			},
+		});
+	}
+
 	if (shouldBypassScramjet(event.request)) {
 		return fetch(event.request);
 	}
 
-	await scramjet.loadConfig();
-	if (scramjet.route(event)) {
-		return scramjet.fetch(event);
-	}
 	return fetch(event.request);
 }
 
