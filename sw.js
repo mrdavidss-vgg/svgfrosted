@@ -5,6 +5,7 @@ const { ScramjetServiceWorker } = $scramjetLoadWorker();
 const scramjet = new ScramjetServiceWorker();
 let uvServiceWorker = null;
 let uvRuntimeLoadError = null;
+let uvRuntimeLoadPromise = null;
 
 const hardBlockedAdKeywords = [
 	"adblock.turtlecute.org/js/pagead.js",
@@ -266,19 +267,29 @@ async function loadScramjetConfigWithRecovery() {
 
 function ensureUvRuntime() {
 	if (uvServiceWorker) {
-		return uvServiceWorker;
+		return Promise.resolve(uvServiceWorker);
 	}
 	if (uvRuntimeLoadError) {
-		throw uvRuntimeLoadError;
+		return Promise.reject(uvRuntimeLoadError);
 	}
-	try {
-		importScripts("./uv/uv.bundle.js?v=5", "./uv/uv.config.js?v=5", "./uv/uv.sw.js?v=5");
-		uvServiceWorker = new UVServiceWorker();
-		return uvServiceWorker;
-	} catch (error) {
-		uvRuntimeLoadError = error;
-		throw error;
+	if (uvRuntimeLoadPromise) {
+		return uvRuntimeLoadPromise;
 	}
+	uvRuntimeLoadPromise = Promise.resolve().then(() => {
+		try {
+			if (!self.__uv$config || !self.UVServiceWorker) {
+				importScripts("./uv/uv.bundle.js?v=5", "./uv/uv.config.js?v=5", "./uv/uv.sw.js?v=5");
+			}
+			uvServiceWorker = new self.UVServiceWorker();
+			return uvServiceWorker;
+		} catch (error) {
+			uvRuntimeLoadError = error;
+			throw error;
+		} finally {
+			uvRuntimeLoadPromise = null;
+		}
+	});
+	return uvRuntimeLoadPromise;
 }
 
 async function handleRequest(event) {
@@ -295,7 +306,7 @@ async function handleRequest(event) {
 
 	if (isUvRequest(event.request.url)) {
 		try {
-			return ensureUvRuntime().fetch(event);
+			return (await ensureUvRuntime()).fetch(event);
 		} catch (error) {
 			console.error("[frosted-sw] uv fetch failed:", error);
 			return new Response("Ultraviolet failed to load this page.", {
