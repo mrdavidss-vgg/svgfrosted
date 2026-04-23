@@ -1,7 +1,7 @@
-importScripts("./scram/scramjet.all.js");
-importScripts("./uv/uv.bundle.js");
-importScripts("./uv/uv.config.js");
-importScripts("./uv/uv.sw.js");
+importScripts("./scram/scramjet.all.js?v=4");
+importScripts("./uv/uv.bundle.js?v=4");
+importScripts("./uv/uv.config.js?v=4");
+importScripts("./uv/uv.sw.js?v=4");
 
 // trying to hard block the new adblock.turtlecute.org scripts (fakeads)
 const { ScramjetServiceWorker } = $scramjetLoadWorker();

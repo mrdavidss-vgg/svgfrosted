@@ -14,12 +14,12 @@
         prefix: uvPfx + "service/",
         encodeUrl: Ultraviolet.codec.xor.encode,
         decodeUrl: Ultraviolet.codec.xor.decode,
-        handler: loc + uvPfx + "uv.handler.js",
-        client: loc + uvPfx + "uv.client.js",
-        bundle: loc + uvPfx + "uv.bundle.js",
-        config: loc + uvPfx + "uv.config.js",
-        sw: loc + uvPfx + "uv.sw.js",
-        stockSW: loc + uvPfx + "sw.js",
+        handler: loc + uvPfx + "uv.handler.js?v=4",
+        client: loc + uvPfx + "uv.client.js?v=4",
+        bundle: loc + uvPfx + "uv.bundle.js?v=4",
+        config: loc + uvPfx + "uv.config.js?v=4",
+        sw: loc + uvPfx + "uv.sw.js?v=4",
+        stockSW: loc + uvPfx + "sw.js?v=4",
         loc: loc,
     };
 })();
