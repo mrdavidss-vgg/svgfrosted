@@ -2,7 +2,7 @@ importScripts('uv.bundle.js');
 importScripts('uv.config.js');
 importScripts(__uv$config.sw || 'uv.sw.js');
 
-const uv = new UVServiceWorker();
+const uvServiceWorker = new UVServiceWorker();
 
 let config = {
     blocklist: new Set(),
@@ -117,14 +117,14 @@ async function serve404() {
 <body>
     <div id="noise"></div>
     <main class="wrap">
-        <div class="badge">Frosted Proxy</div>
+        <div class="badge">Frosted</div>
         <h1>Frosted | Error</h1>
-        <p>This page could not be loaded through UV.<br />Refresh the tab or return to your start page and try again.</p>
+        <p>This page could not be loaded through UV.<br />please contact mrdavidss@discord.</p>
         <div class="actions">
             <button onclick="window.top.location.reload()">Refresh</button>
         </div>
     </main>
-    <div class="footer">FROSTED</div>
+    <div class="footer">frosted</div>
     <script>
         if (window.parent && window.parent !== window) {
             window.parent.postMessage({ type: 'uv-error' }, '*');
@@ -134,22 +134,20 @@ async function serve404() {
 </html>`;
 
     return new Response(errorHtml, {
-        status: 200, // Using 200 to ensure the browser renders the custom HTML inside the iframe
+        status: 200,
         headers: { 'Content-Type': 'text/html' }
     });
 }
 
 async function handleRequest(event) {
-    if (uv.route(event)) {
+    if (uvServiceWorker.route(event)) {
         try {
-            const response = await uv.fetch(event);
+            const response = await uvServiceWorker.fetch(event);
 
-            // Override UV default error page or server errors (500, 502)
             if ([404, 500, 502, 503].includes(response.status)) {
                 return await serve404();
             }
 
-            // Inspect for UV's internal error messages in the body
             const contentType = response.headers.get('content-type') || '';
             if (contentType.includes('text/html')) {
                 const cloned = response.clone();
